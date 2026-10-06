@@ -345,6 +345,41 @@ def main() -> int:
                            {"graph": ok_precheck["graph"]}, expect_status=400)
     assert pre_env["error"] == "invalid_payload", pre_env
 
+    # 19. 版本恢复：把历史版本 v1 整体恢复为新的生效版本（版本号递增，非回拨）
+    ver_now = call("GET", "/version")[1]
+    status, restored = call("POST", "/admin/restore", {"version": 1})
+    assert restored["status"] == "restored", restored
+    assert restored["source_version"] == 1, restored
+    assert restored["previous_version"] == ver_now["data_version"], restored
+    assert restored["data_version"] == ver_now["data_version"] + 1, restored
+    v_after = call("GET", "/version")[1]
+    assert v_after["data_version"] == restored["data_version"], v_after
+    # v1 是纯步道图版本：封闭记录与反向窗计数随内容整体恢复
+    assert v_after["closures"] == 0 and v_after["reverse_windows"] == 0, v_after
+    print(f"版本恢复: v{ver_now['data_version']} -> v{restored['data_version']}"
+          f"（内容=v1，历史版本仍可追溯）")
+
+    # 恢复回冒烟前的版本，保证服务数据不受影响
+    status, back = call("POST", "/admin/restore",
+                        {"version": ver_now["data_version"]})
+    assert back["source_version"] == ver_now["data_version"], back
+    v_back = call("GET", "/version")[1]
+    assert v_back["closures"] == ver_now["closures"], v_back
+    assert v_back["reverse_windows"] == ver_now["reverse_windows"], v_back
+
+    # 目标版本不存在 → 404 version_not_found，生效版本不变
+    status, nf = call("POST", "/admin/restore", {"version": 999999},
+                      expect_status=404)
+    assert nf["error"] == "version_not_found" and nf["rejected"] is True, nf
+    assert nf["active_version"] == v_back["data_version"], nf
+    # 参数非法 → 400 invalid_payload，生效版本不变
+    for bad_payload in ({"version": 0}, {"version": "1"}, {"version": True}, {}):
+        status, bad = call("POST", "/admin/restore", bad_payload,
+                           expect_status=400)
+        assert bad["error"] == "invalid_payload", bad
+    assert call("GET", "/version")[1]["data_version"] == v_back["data_version"]
+    print("恢复拒绝：不存在版本 404、非法参数 400，生效版本均不变 ✔")
+
     if failures:
         print("\n".join("FAIL: " + f for f in failures), file=sys.stderr)
         return 1

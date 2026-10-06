@@ -204,6 +204,27 @@ def normalize_closures(payload: Any, known_edges: set[str]) -> list[dict]:
     return closures
 
 
+def normalize_restore(payload: Any) -> int:
+    """校验版本恢复请求负载，返回目标版本号。
+
+    期望格式::
+
+        {"version": 2}
+
+    ``version`` 必须是正整数版本号（严格类型：拒绝布尔、浮点、数字字符串）。
+    版本 0 表示“尚未发布任何数据”，不是可恢复的历史版本。
+    """
+    data = _require_object(payload, "恢复请求")
+    if "version" not in data:
+        raise ValidationError("恢复请求缺少 version 字段")
+    value = data["version"]
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValidationError("version 必须是正整数版本号")
+    if value <= 0:
+        raise ValidationError(f"version 必须是正整数版本号，收到 {value}")
+    return value
+
+
 def _normalize_stop(raw: Any, index: int, node_set: set[str]) -> dict:
     """校验一个按顺序停靠点。
 

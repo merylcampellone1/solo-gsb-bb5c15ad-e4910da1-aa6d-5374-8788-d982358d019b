@@ -5,7 +5,8 @@
     python -m app.cli init-db                 # 建库并导入内置示例数据
     python -m app.cli import-graph graph.json
     python -m app.cli import-closures closures.json
-    python -m app.cli serve                   # 启动 HTTP 服务
+    python -m app.cli restore 2             # 把历史版本 v2 整体恢复为新的生效版本
+    python -m app.cli serve                 # 启动 HTTP 服务
 """
 import argparse
 import json
@@ -13,7 +14,15 @@ import sys
 from pathlib import Path
 
 from . import config
-from .db import connect, current_version, init_db, publish_closures, publish_graph
+from .db import (
+    VersionNotFoundError,
+    connect,
+    current_version,
+    init_db,
+    publish_closures,
+    publish_graph,
+    restore_version,
+)
 from .schemas import ValidationError
 
 
@@ -85,6 +94,19 @@ def cmd_import_closures(args) -> int:
     return 0
 
 
+def cmd_restore(args) -> int:
+    conn = connect()
+    init_db(conn)
+    old = current_version(conn)
+    try:
+        new = restore_version(conn, args.version)
+    except (ValidationError, VersionNotFoundError) as exc:
+        print(f"恢复被拒绝（当前版本 v{old} 保持不变）: {exc}", file=sys.stderr)
+        return 1
+    print(f"已把 v{args.version} 整体恢复为新的生效版本: v{old} -> v{new}")
+    return 0
+
+
 def cmd_serve(args) -> int:
     import uvicorn
 
@@ -127,6 +149,10 @@ def main(argv=None) -> int:
     p_c = sub.add_parser("import-closures", help="原子导入封闭记录 JSON")
     p_c.add_argument("file")
     p_c.set_defaults(func=cmd_import_closures)
+
+    p_r = sub.add_parser("restore", help="把历史版本整体恢复为新的生效版本")
+    p_r.add_argument("version", type=int, help="要恢复的历史版本号（正整数）")
+    p_r.set_defaults(func=cmd_restore)
 
     p_s = sub.add_parser("serve", help="启动 HTTP 服务")
     p_s.set_defaults(func=cmd_serve)

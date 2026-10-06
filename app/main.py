@@ -10,12 +10,14 @@ from fastapi.responses import JSONResponse
 
 from . import config
 from .db import (
+    VersionNotFoundError,
     connect,
     current_version,
     get_snapshot,
     init_db,
     publish_closures,
     publish_graph,
+    restore_version,
 )
 from .precheck import precheck as run_precheck
 from .routing import (
@@ -327,6 +329,55 @@ async def import_graph(request: Request):
             )
         return {
             "status": "published",
+            "data_version": new_version,
+            "previous_version": old_version,
+        }
+    finally:
+        conn.close()
+
+
+@app.post("/admin/restore")
+async def restore_to_version(request: Request):
+    """把指定历史版本整体恢复为新的生效版本（版本号继续递增，不回拨指针）。"""
+    try:
+        payload = await request.json()
+    except Exception:
+        return JSONResponse(
+            status_code=400, content={"error": "invalid_payload", "detail": "请求体必须是合法 JSON"}
+        )
+    conn = connect()
+    try:
+        init_db(conn)
+        old_version = current_version(conn)
+        from .schemas import normalize_restore
+
+        try:
+            target = normalize_restore(payload)
+        except PayloadValidationError as exc:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": "invalid_payload",
+                    "detail": str(exc),
+                    "rejected": True,
+                    "active_version": old_version,
+                },
+            )
+        try:
+            new_version = restore_version(conn, target)
+        except VersionNotFoundError as exc:
+            return JSONResponse(
+                status_code=404,
+                content={
+                    "error": "version_not_found",
+                    "detail": str(exc),
+                    "rejected": True,
+                    "active_version": old_version,
+                },
+            )
+        return {
+            "status": "restored",
+            "source_version": target,
             "data_version": new_version,
             "previous_version": old_version,
         }

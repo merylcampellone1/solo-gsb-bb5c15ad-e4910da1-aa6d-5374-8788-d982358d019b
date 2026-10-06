@@ -8,7 +8,9 @@
 指定**按顺序停靠的站点**（每站带开始停留时间窗与停留秒数），见第 4.1 节；
 也支持为**多名访客**在候选节点中选择公共汇合点，见第 4.2 节。导入前可用
 **联合预检**接口一次性校验候选步道图与封闭记录（含反向通行窗），返回
-全部可判定错误且不改动当前数据，见第 4.3 节。
+全部可判定错误且不改动当前数据，见第 4.3 节。误发布后可用**版本恢复**
+把任一历史版本的节点、路段、封闭记录与反向通行窗整体恢复为新的生效版本
+（版本号继续递增，历史仍可追溯），见第 4.4 节。
 
 - 语言/存储：Python 3.11 + SQLite（标准库，无需外部数据库）
 - Web 框架：FastAPI + Uvicorn
@@ -428,6 +430,49 @@ python -m app.cli serve
 | 候选数据未通过校验（响应体含全部错误明细） | `200` | —（`ok: false`） |
 | 请求包络非法（非 JSON 对象、缺少 `graph`/`closures`） | `400` | `invalid_payload` |
 
+### 4.4 版本恢复（`POST /admin/restore`）
+
+管理员误发布步道图或封闭记录后，把某个**已存在的历史版本**的节点、
+路段、封闭记录与反向通行窗**整体恢复为新的生效版本**：
+
+```bash
+curl -X POST http://localhost:8080/admin/restore \
+  -H 'Content-Type: application/json' \
+  -d '{"version": 2}'
+```
+
+响应 `200`：
+
+```json
+{
+  "status": "restored",
+  "source_version": 2,
+  "data_version": 5,
+  "previous_version": 4
+}
+```
+
+- `source_version` 为被恢复的历史版本，`data_version` 为恢复生成的
+  **新**生效版本，`previous_version` 为恢复前的生效版本；
+- 恢复**不是回拨指针**：版本号继续递增，历史版本（含被覆盖的误发布
+  版本）全部保留，仍可按版本号追溯；
+- 恢复与导入（`/admin/graph`、`/admin/closures`）共用同一串行写事务：
+  并发时按提交顺序生效，任一时刻的生效版本都是完整数据；路线查询在
+  请求开始时固定版本指针，只会读到恢复前**或**恢复后的完整状态，
+  不会读到拼接数据；
+- 恢复当前版本自身是允许的（生成一个内容相同的新版本）；
+- 命令行等价用法：`python -m app.cli restore 2`。
+
+错误映射：
+
+| 场景 | 状态码 | `error` |
+| --- | --- | --- |
+| 请求体非 JSON、缺 `version`、`version` 非正整数 | `400` | `invalid_payload` |
+| 目标版本不存在 | `404` | `version_not_found` |
+
+拒绝时响应体含 `"rejected": true` 与当前仍生效的 `active_version`，
+生效版本保持不变。
+
 ### `POST /admin/graph` — 原子发布新步道图
 
 ```bash
@@ -585,7 +630,25 @@ curl -s -X POST http://localhost:8080/admin/precheck \
 #      {"source":"closures","path":"closures[0]","index":0,"message":"...无效时间区间..."}],
 #    "data_version":...}
 
-# 冒烟自检（需服务已启动；内含反向窗导入/拒绝、窗内通行与联合预检检查）
+# 版本恢复：把历史版本 v2 的节点/路段/封闭记录/反向窗整体恢复为新的生效版本
+curl -s -X POST http://localhost:8080/admin/restore \
+  -H 'Content-Type: application/json' \
+  -d '{"version": 2}'
+# → {"status":"restored","source_version":2,"data_version":5,"previous_version":4}
+
+# 目标版本不存在 → 404 version_not_found，active_version 保持不变
+curl -s -X POST http://localhost:8080/admin/restore \
+  -H 'Content-Type: application/json' \
+  -d '{"version": 999}'
+# → {"error":"version_not_found","detail":"版本 v999 不存在，无法恢复",
+#    "rejected":true,"active_version":5}
+
+# 参数非法（version 非正整数）→ 400 invalid_payload，active_version 保持不变
+curl -s -X POST http://localhost:8080/admin/restore \
+  -H 'Content-Type: application/json' \
+  -d '{"version": "2"}'
+
+# 冒烟自检（需服务已启动；内含反向窗导入/拒绝、窗内通行、联合预检与版本恢复检查）
 python3 scripts/smoke_test.py http://localhost:8080
 ```
 
@@ -696,6 +759,22 @@ else:
         print(err["source"], err["path"], err["message"])
 ```
 
+版本恢复 Python 示例：
+
+```python
+import json, urllib.request
+
+req = urllib.request.Request(
+    "http://localhost:8080/admin/restore",
+    data=json.dumps({"version": 2}).encode(),  # 要恢复的历史版本号
+    headers={"Content-Type": "application/json"},
+)
+with urllib.request.urlopen(req) as resp:
+    result = json.load(resp)
+print("来源版本:", result["source_version"],
+      "新生效版本:", result["data_version"])
+```
+
 ---
 
 ## 6. 选路与版本语义
@@ -730,6 +809,12 @@ else:
   - 每次查询在开始时读取一次 `current_version` 并固定，**整次请求只用同一版本**，
     导入进行中或刚完成都不会看到半个版本；
   - 历史版本在库中保留，可按版本号追溯。
+- **版本恢复**（`POST /admin/restore`）：把指定历史版本的节点、路段、封闭记录与
+  反向通行窗整体复制为**新的**生效版本——版本号继续递增、历史版本原样保留，
+  绝不回拨 `current_version` 指针。恢复与导入在同一 `BEGIN IMMEDIATE` 写事务
+  队列中串行提交，并发时生效顺序即提交顺序；查询侧仍按请求开始时的版本指针
+  读取，只会看到恢复前或恢复后的完整状态。目标版本不存在或参数非法时拒绝
+  操作，生效版本不变。
 
 ---
 
@@ -745,10 +830,10 @@ app/
   routing.py       # 时间依赖最短路 + 字典序选路引擎（含按顺序停靠、多人汇合、反向窗）
   main.py          # FastAPI 路由
   sample_data.py   # 内置示例数据
-  cli.py           # init-db / import-* / serve
+  cli.py           # init-db / import-* / restore / serve
 data/              # 示例 JSON 与本地数据库
 scripts/smoke_test.py
-tests/             # 标准库 unittest 测试（136 个用例）
+tests/             # 标准库 unittest 测试（147 个用例）
 Dockerfile
 docker-compose.yml
 docker-entrypoint.sh
@@ -770,4 +855,7 @@ python3 -m unittest discover -s tests -v
 无效/重叠窗拒绝整次导入并保留旧版本、版本快照与复制）、
 联合预检（全部错误收集与原数组位置、候选图交叉校验封闭引用、
 图无效时封闭引用不误报、通过时计数、预检不改变数据版本）、
+版本恢复（整体恢复为新生效版本、版本号递增且历史可追溯、
+非法参数与不存在版本拒绝且生效版本不变、与发布并发时串行生效、
+旧库 versions 表自动迁移）、
 无路线、原子发布回滚与版本快照等场景。

@@ -9,6 +9,10 @@
 - 查询通过 :func:`get_snapshot` 在开始时读取一次指针，整次请求固定使用该版本。
 
 导入失败时事务整体回滚，旧版本保持不动。
+
+版本恢复（:func:`restore_version`）把指定历史版本的四类数据整体复制为一个
+**新的**生效版本：版本号继续递增、历史版本原样保留，绝不回拨指针。恢复与
+导入共用同一 ``BEGIN IMMEDIATE`` 写事务，彼此串行，生效顺序即提交顺序。
 """
 import json
 import sqlite3
@@ -17,7 +21,7 @@ from pathlib import Path
 from typing import NamedTuple, Optional
 
 from . import config
-from .schemas import normalize_closures, normalize_graph
+from .schemas import ValidationError, normalize_closures, normalize_graph
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -27,7 +31,7 @@ CREATE TABLE IF NOT EXISTS meta (
 
 CREATE TABLE IF NOT EXISTS versions (
     version_id  INTEGER PRIMARY KEY AUTOINCREMENT,
-    kind        TEXT NOT NULL CHECK (kind IN ('graph', 'closures')),
+    kind        TEXT NOT NULL CHECK (kind IN ('graph', 'closures', 'restore')),
     created_at  INTEGER NOT NULL DEFAULT (strftime('%s','now'))
 );
 
@@ -123,6 +127,35 @@ def init_db(conn: sqlite3.Connection) -> None:
     conn.execute(
         "INSERT OR IGNORE INTO meta(key, value) VALUES ('current_version', '0')"
     )
+    _migrate_versions_kind(conn)
+
+
+def _migrate_versions_kind(conn: sqlite3.Connection) -> None:
+    """旧库的 ``versions.kind`` CHECK 不含 ``'restore'`` 时，原地重建该表。
+
+    建表语句中的 CHECK 约束无法就地修改，按 SQLite 惯例
+    “建新表 → 复制 → 删旧表 → 改名”迁移；已有版本行原样保留。
+    """
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='versions'"
+    ).fetchone()
+    if row is None or "'restore'" in row["sql"]:
+        return
+    with transaction(conn):
+        conn.execute("DROP TABLE IF EXISTS versions_new")
+        conn.execute(
+            "CREATE TABLE versions_new ("
+            "    version_id  INTEGER PRIMARY KEY AUTOINCREMENT,"
+            "    kind        TEXT NOT NULL CHECK (kind IN ('graph', 'closures', 'restore')),"
+            "    created_at  INTEGER NOT NULL DEFAULT (strftime('%s','now'))"
+            ")"
+        )
+        conn.execute(
+            "INSERT INTO versions_new(version_id, kind, created_at) "
+            "SELECT version_id, kind, created_at FROM versions"
+        )
+        conn.execute("DROP TABLE versions")
+        conn.execute("ALTER TABLE versions_new RENAME TO versions")
 
 
 @contextmanager
@@ -242,6 +275,38 @@ def publish_closures(conn: sqlite3.Connection, payload) -> int:
             "VALUES (?, ?, ?, ?, ?)",
             [(new, i, c["edge_id"], c["start"], c["end"]) for i, c in enumerate(closures)],
         )
+        conn.execute(
+            "UPDATE meta SET value=? WHERE key='current_version'", (str(new),)
+        )
+    return new
+
+
+class VersionNotFoundError(ValueError):
+    """恢复目标版本不存在（恢复被拒绝，生效版本不变）。"""
+
+
+def restore_version(conn: sqlite3.Connection, target: int) -> int:
+    """把历史版本 ``target`` 整体恢复为新的生效版本。
+
+    在单个写事务中完成：校验目标版本存在 → 分配递增的新版本号 → 完整复制
+    目标版本的节点/路段/封闭记录/反向通行窗 → 切换 ``current_version`` 指针。
+    目标版本本身原样保留（历史仍可追溯），指针只前进不回拨。
+
+    目标不存在时抛出 :class:`VersionNotFoundError` 并整体回滚，生效版本不变；
+    目标版本号非法（非正整数）时抛出 :class:`ValidationError`。
+    """
+    if isinstance(target, bool) or not isinstance(target, int) or target <= 0:
+        raise ValidationError(f"恢复目标版本号必须是正整数，收到 {target!r}")
+    with transaction(conn):
+        exists = conn.execute(
+            "SELECT 1 FROM versions WHERE version_id=?", (target,)
+        ).fetchone()
+        if exists is None:
+            raise VersionNotFoundError(f"版本 v{target} 不存在，无法恢复")
+        new = int(
+            conn.execute("SELECT COALESCE(MAX(version_id), 0) + 1 AS v FROM versions").fetchone()["v"]
+        )
+        _copy_version(conn, target, new, "restore")
         conn.execute(
             "UPDATE meta SET value=? WHERE key='current_version'", (str(new),)
         )
