@@ -1,0 +1,356 @@
+#!/usr/bin/env python3
+"""针对运行中服务的端到端冒烟测试（仅用标准库）。
+
+用法::
+
+    python3 scripts/smoke_test.py [BASE_URL]
+
+默认 http://127.0.0.1:8080。退出码非 0 表示冒烟失败。
+"""
+import json
+import sys
+import urllib.error
+import urllib.request
+
+BASE = sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:8080"
+failures = []
+
+
+def call(method: str, path: str, body=None, expect_status=200):
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(
+        BASE + path, data=data, method=method,
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            status = resp.status
+            payload = json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        status = e.code
+        payload = json.loads(e.read().decode())
+    tag = f"{method} {path}"
+    if status != expect_status:
+        failures.append(f"{tag}: 期望 HTTP {expect_status}，实际 {status}，body={payload}")
+    return status, payload
+
+
+def main() -> int:
+    status, health = call("GET", "/health")
+    assert health.get("has_data"), health
+
+    # 1. 正常查询（示例数据：E4 在 10:00-11:00 封闭）
+    status, route = call("POST", "/api/route", {
+        "origin": "GATE", "destination": "TOWER",
+        "departure_time": "2026-10-05T09:55:00Z",
+        "avoid_stairs": False,
+    })
+    assert status == 200, route
+    assert "stops" not in route, route  # 无停靠点时保持原有返回结构
+    print("普通查询:", route["edge_sequence"], "->", route["arrival_time"])
+
+    # 2. 避台阶：只能走 E1 E3 E5
+    status, route_flat = call("POST", "/api/route", {
+        "origin": "GATE", "destination": "TOWER",
+        "departure_time": "2026-10-05T08:00:00Z",
+        "avoid_stairs": True,
+    })
+    assert route_flat["edge_sequence"] == ["E1", "E3", "E5"], route_flat
+    print("避台阶查询:", route_flat["edge_sequence"])
+
+    # 3. 未知节点 → 400
+    status, err = call("POST", "/api/route", {
+        "origin": "GHOST", "destination": "TOWER",
+        "departure_time": "2026-10-05T08:00:00Z",
+    }, expect_status=400)
+    assert err["error"] == "invalid_payload", err
+
+    # 4. 非法导入（引用未知节点）→ 400 且版本不变
+    before = call("GET", "/version")[1]
+    status, bad = call("POST", "/admin/graph", {
+        "nodes": ["X"],
+        "edges": [{"id": "X1", "from": "X", "to": "Y",
+                   "travel_seconds": 10, "has_stairs": False}],
+    }, expect_status=400)
+    after = call("GET", "/version")[1]
+    assert before["data_version"] == after["data_version"] == bad["active_version"], (before, after, bad)
+    print(f"拒绝非法导入，保留版本 v{after['data_version']}")
+
+    # 5. 非法秒数 → 400
+    status, bad2 = call("POST", "/admin/graph", {
+        "nodes": ["X", "Y"],
+        "edges": [{"id": "X1", "from": "X", "to": "Y",
+                   "travel_seconds": 0, "has_stairs": False}],
+    }, expect_status=400)
+    assert "正数" in bad2["detail"], bad2
+
+    # 6. 无效时间区间 → 400
+    status, bad3 = call("POST", "/admin/closures", {
+        "closures": [{"edge_id": "E1",
+                      "start": "2026-10-05T10:00:00Z",
+                      "end": "2026-10-05T09:00:00Z"}],
+    }, expect_status=400)
+
+    # 7. 按顺序停靠：LAKE 窗口 [09:00,09:10] 停留 300s
+    #    08:50 出发 → 08:58 抵 LAKE，等窗至 09:00，09:05 离开，09:09 到 TOWER
+    status, route_stop = call("POST", "/api/route", {
+        "origin": "GATE", "destination": "TOWER",
+        "departure_time": "2026-10-05T08:50:00Z",
+        "stops": [{"node": "LAKE",
+                   "earliest_start": "2026-10-05T09:00:00Z",
+                   "latest_start": "2026-10-05T09:10:00Z",
+                   "stay_seconds": 300}],
+    })
+    assert route_stop["edge_sequence"] == ["E1", "E3", "E5"], route_stop
+    assert route_stop["arrival_time"] == "2026-10-05T09:09:00Z", route_stop
+    (visit,) = route_stop["stops"]
+    assert (visit["arrival_time"], visit["start_time"], visit["end_time"]) == (
+        "2026-10-05T08:58:00Z", "2026-10-05T09:00:00Z", "2026-10-05T09:05:00Z"), visit
+    assert route_stop["total_stay_seconds"] == 300, route_stop
+    print("停靠查询:", visit["node"], visit["start_time"], "->", route_stop["arrival_time"])
+
+    # 8. 停靠窗口不可行（最晚 08:55 早于抵达 08:58）→ 404 no_route
+    status, nr = call("POST", "/api/route", {
+        "origin": "GATE", "destination": "TOWER",
+        "departure_time": "2026-10-05T08:50:00Z",
+        "stops": [{"node": "LAKE",
+                   "earliest_start": "2026-10-05T08:00:00Z",
+                   "latest_start": "2026-10-05T08:55:00Z",
+                   "stay_seconds": 60}],
+    }, expect_status=404)
+    assert nr["error"] == "no_route", nr
+
+    # 9. 停留秒数非法 / 停靠地点未知 → 400 invalid_payload
+    status, bad4 = call("POST", "/api/route", {
+        "origin": "GATE", "destination": "TOWER",
+        "departure_time": "2026-10-05T08:50:00Z",
+        "stops": [{"node": "LAKE",
+                   "earliest_start": "2026-10-05T09:00:00Z",
+                   "latest_start": "2026-10-05T09:10:00Z",
+                   "stay_seconds": -1}],
+    }, expect_status=400)
+    assert bad4["error"] == "invalid_payload", bad4
+    status, bad5 = call("POST", "/api/route", {
+        "origin": "GATE", "destination": "TOWER",
+        "departure_time": "2026-10-05T08:50:00Z",
+        "stops": [{"node": "GHOST",
+                   "earliest_start": "2026-10-05T09:00:00Z",
+                   "latest_start": "2026-10-05T09:10:00Z",
+                   "stay_seconds": 60}],
+    }, expect_status=400)
+    assert bad5["error"] == "invalid_payload", bad5
+
+    # 10. 多人汇合：alice 09:55 从 GATE、bob 09:50 从 PLAZA；
+    #     LAKE：alice 10:03 到、bob 09:55 到 → 汇合 10:03
+    #     TOWER：alice 10:07 到、bob 09:59 到 → 汇合 10:07 → 选 LAKE
+    status, meeting = call("POST", "/api/meeting", {
+        "visitors": [
+            {"id": "alice", "origin": "GATE",
+             "departure_time": "2026-10-05T09:55:00Z", "avoid_stairs": False},
+            {"id": "bob", "origin": "PLAZA",
+             "departure_time": "2026-10-05T09:50:00Z", "avoid_stairs": False},
+        ],
+        "candidates": ["TOWER", "LAKE"],
+        "latest_meeting_time": "2026-10-05T12:00:00Z",
+    })
+    assert meeting["meeting_node"] == "LAKE", meeting
+    assert meeting["meeting_time"] == "2026-10-05T10:03:00Z", meeting
+    alice, bob = meeting["visitors"]
+    assert alice["edge_sequence"] == ["E1", "E3"], alice
+    assert alice["wait_after_arrival_seconds"] == 0
+    assert bob["edge_sequence"] == ["E3"]
+    assert bob["wait_after_arrival_seconds"] == 480, bob
+    print("汇合查询:", meeting["meeting_node"], meeting["meeting_time"])
+
+    # 11. 最晚汇合时刻早于全员可达时刻 → 404 no_meeting_candidate
+    status, nm = call("POST", "/api/meeting", {
+        "visitors": [
+            {"origin": "GATE", "departure_time": "2026-10-05T09:55:00Z"},
+            {"origin": "PLAZA", "departure_time": "2026-10-05T09:50:00Z"},
+        ],
+        "candidates": ["LAKE"],
+        "latest_meeting_time": "2026-10-05T10:00:00Z",
+    }, expect_status=404)
+    assert nm["error"] == "no_meeting_candidate", nm
+
+    # 12. 汇合参数非法：访客不足两人 / 未知候选节点 / 候选为空 → 400
+    status, mb1 = call("POST", "/api/meeting", {
+        "visitors": [{"origin": "GATE", "departure_time": "2026-10-05T09:00:00Z"}],
+        "candidates": ["LAKE"],
+        "latest_meeting_time": "2026-10-05T12:00:00Z",
+    }, expect_status=400)
+    assert mb1["error"] == "invalid_payload", mb1
+    status, mb2 = call("POST", "/api/meeting", {
+        "visitors": [
+            {"origin": "GATE", "departure_time": "2026-10-05T09:00:00Z"},
+            {"origin": "PLAZA", "departure_time": "2026-10-05T09:00:00Z"},
+        ],
+        "candidates": ["GHOST"],
+        "latest_meeting_time": "2026-10-05T12:00:00Z",
+    }, expect_status=400)
+    assert mb2["error"] == "invalid_payload", mb2
+    status, mb3 = call("POST", "/api/meeting", {
+        "visitors": [
+            {"origin": "GATE", "departure_time": "2026-10-05T09:00:00Z"},
+            {"origin": "PLAZA", "departure_time": "2026-10-05T09:00:00Z"},
+        ],
+        "candidates": [],
+        "latest_meeting_time": "2026-10-05T12:00:00Z",
+    }, expect_status=400)
+    assert mb3["error"] == "invalid_payload", mb3
+
+    # 13. 反向时间窗：给 E5(LAKE->TOWER,240s) 增加活动时段反向窗，
+    #     其余路段不变（E4 的封闭引用因此保留）
+    version_before = call("GET", "/version")[1]
+    reverse_graph = {
+        "nodes": ["GATE", "PLAZA", "HILL", "LAKE", "TOWER"],
+        "edges": [
+            {"id": "E1", "from": "GATE", "to": "PLAZA", "travel_seconds": 180, "has_stairs": False},
+            {"id": "E2", "from": "PLAZA", "to": "HILL", "travel_seconds": 240, "has_stairs": True},
+            {"id": "E3", "from": "PLAZA", "to": "LAKE", "travel_seconds": 300, "has_stairs": False},
+            {"id": "E4", "from": "HILL", "to": "TOWER", "travel_seconds": 120, "has_stairs": True},
+            {"id": "E5", "from": "LAKE", "to": "TOWER", "travel_seconds": 240, "has_stairs": False,
+             "reverse_windows": [
+                 {"start": "2026-10-05T11:00:00Z", "end": "2026-10-05T13:00:00Z"},
+                 {"start": "2026-10-05T14:00:00Z", "end": "2026-10-05T16:00:00Z"}]},
+            {"id": "E6", "from": "PLAZA", "to": "TOWER", "travel_seconds": 600, "has_stairs": True},
+        ],
+    }
+    status, published = call("POST", "/admin/graph", reverse_graph)
+    assert status == 200, published
+    ver = call("GET", "/version")[1]
+    assert ver["reverse_windows"] == 2, ver
+    print(f"已发布反向窗步道图 v{published['data_version']}")
+
+    # 14. 窗内反向：TOWER 12:00 出发，等 0 秒即反向走 E5 -> 12:04 到 LAKE
+    status, rev = call("POST", "/api/route", {
+        "origin": "TOWER", "destination": "LAKE",
+        "departure_time": "2026-10-05T12:00:00Z",
+    })
+    assert status == 200, rev
+    (seg,) = rev["segments"]
+    assert seg["edge_id"] == "E5", rev
+    assert (seg["from_node"], seg["to_node"]) == ("TOWER", "LAKE"), seg
+    assert seg["enter_time"] == "2026-10-05T12:00:00Z", seg
+    assert seg["leave_time"] == "2026-10-05T12:04:00Z", seg
+    print("反向窗内通行:", seg["from_node"], "->", seg["to_node"], seg["leave_time"])
+
+    # 15. 窗外反向不可达：09:00 出发需等到 11:00 开窗（允许节点等待），
+    #     11:00 进入、11:04 到达；再测窗结束后的时刻无后续窗可用 → 404
+    status, wait_rev = call("POST", "/api/route", {
+        "origin": "TOWER", "destination": "LAKE",
+        "departure_time": "2026-10-05T09:00:00Z",
+    })
+    assert wait_rev["segments"][0]["enter_time"] == "2026-10-05T11:00:00Z", wait_rev
+    assert wait_rev["segments"][0]["waiting_seconds"] == 7200, wait_rev
+    status, no_rev = call("POST", "/api/route", {
+        "origin": "TOWER", "destination": "LAKE",
+        "departure_time": "2026-10-05T16:30:00Z",
+    }, expect_status=404)
+    assert no_rev["error"] == "no_route", no_rev
+    print("窗外反向：等窗开放可走，之后无窗则 404")
+
+    # 16. 窗内原方向禁行：LAKE 12:00 出发须等到 13:00 窗结束再走 E5
+    status, fwd = call("POST", "/api/route", {
+        "origin": "LAKE", "destination": "TOWER",
+        "departure_time": "2026-10-05T12:00:00Z",
+    })
+    (fseg,) = fwd["segments"]
+    assert (fseg["from_node"], fseg["to_node"]) == ("LAKE", "TOWER"), fseg
+    assert fseg["enter_time"] == "2026-10-05T13:00:00Z", fseg
+    assert fseg["waiting_seconds"] == 3600, fseg
+    print("窗内原方向等待至窗结束:", fseg["enter_time"])
+
+    # 17. 反向窗无效 / 重叠 → 拒绝整次导入，保留旧版本
+    bad_rev = json.loads(json.dumps(reverse_graph))
+    bad_rev["edges"][4]["reverse_windows"] = [
+        {"start": "2026-10-05T11:00:00Z", "end": "2026-10-05T11:00:00Z"}]
+    status, rejected = call("POST", "/admin/graph", bad_rev, expect_status=400)
+    assert rejected["error"] == "invalid_payload" and rejected["rejected"] is True, rejected
+    overlap = json.loads(json.dumps(reverse_graph))
+    overlap["edges"][4]["reverse_windows"] = [
+        {"start": "2026-10-05T11:00:00Z", "end": "2026-10-05T12:30:00Z"},
+        {"start": "2026-10-05T12:00:00Z", "end": "2026-10-05T13:00:00Z"}]
+    status, rejected2 = call("POST", "/admin/graph", overlap, expect_status=400)
+    assert rejected2["active_version"] == published["data_version"], rejected2
+    assert call("GET", "/version")[1]["reverse_windows"] == 2
+    print("无效/重叠反向窗拒绝导入，旧版本保留")
+
+    # 恢复不带反向窗的示例图，避免影响后续重复冒烟
+    call("POST", "/admin/graph", {
+        "nodes": reverse_graph["nodes"],
+        "edges": [{k: v for k, v in e.items() if k != "reverse_windows"}
+                  for e in reverse_graph["edges"]],
+    })
+    assert call("GET", "/version")[1]["reverse_windows"] == 0
+    print("已恢复无反向窗示例图")
+
+    # 18. 联合预检：候选图 + 封闭记录一次校验，只读不改变当前版本
+    version_before = call("GET", "/version")[1]
+    ok_precheck = {
+        "graph": {
+            "nodes": ["N1", "N2", "N3"],
+            "edges": [
+                {"id": "A1", "from": "N1", "to": "N2", "travel_seconds": 60, "has_stairs": False},
+                {"id": "A2", "from": "N2", "to": "N3", "travel_seconds": 90, "has_stairs": True,
+                 "reverse_windows": [
+                     {"start": "2026-10-05T11:00:00Z", "end": "2026-10-05T12:00:00Z"},
+                     {"start": "2026-10-05T13:00:00Z", "end": "2026-10-05T14:00:00Z"}]},
+            ],
+        },
+        "closures": {"closures": [
+            {"edge_id": "A1", "start": "2026-10-05T08:00:00Z", "end": "2026-10-05T09:00:00Z"}]},
+    }
+    status, pre = call("POST", "/admin/precheck", ok_precheck)
+    assert status == 200 and pre["ok"] is True and pre["errors"] == [], pre
+    assert pre["counts"] == {"nodes": 3, "edges": 2, "closures": 1, "reverse_windows": 2}, pre
+    assert pre["data_version"] == version_before["data_version"], pre
+    print("联合预检通过:", pre["counts"])
+
+    # 候选图有效时，封闭记录按候选图的路段编号校验（与库中版本无关）
+    status, pre_ref = call("POST", "/admin/precheck", {
+        "graph": ok_precheck["graph"],
+        "closures": {"closures": [
+            {"edge_id": "ZZ", "start": "2026-10-05T08:00:00Z", "end": "2026-10-05T09:00:00Z"}]},
+    })
+    assert pre_ref["ok"] is False, pre_ref
+    assert [(e["source"], e["path"], e["index"]) for e in pre_ref["errors"]] == [
+        ("closures", "closures[0].edge_id", 0)], pre_ref
+
+    # 候选图无效：封闭记录的路段引用不误报，自身错误仍报告；版本不变
+    status, pre_bad = call("POST", "/admin/precheck", {
+        "graph": {
+            "nodes": ["N1", "N2"],
+            "edges": [
+                {"id": "A1", "from": "N1", "to": "GHOST",
+                 "travel_seconds": 0, "has_stairs": False},
+            ],
+        },
+        "closures": {"closures": [
+            {"edge_id": "A1", "start": "2026-10-05T09:00:00Z", "end": "2026-10-05T08:00:00Z"},
+            {"edge_id": "UNKNOWN", "start": "2026-10-05T08:00:00Z", "end": "2026-10-05T09:00:00Z"},
+        ]},
+    })
+    assert status == 200 and pre_bad["ok"] is False, pre_bad
+    paths = {(e["source"], e["path"]) for e in pre_bad["errors"]}
+    assert ("graph", "edges[0].to") in paths, pre_bad
+    assert ("graph", "edges[0].travel_seconds") in paths, pre_bad
+    assert ("closures", "closures[0]") in paths, pre_bad  # 自身时间区间错误
+    assert ("closures", "closures[1].edge_id") not in paths, pre_bad  # 图无效→不误报引用
+    assert call("GET", "/version")[1]["data_version"] == version_before["data_version"]
+    print("联合预检失败: 收集全部错误且不改动版本 ✔")
+
+    # 预检包络非法（缺 closures）→ 400
+    status, pre_env = call("POST", "/admin/precheck",
+                           {"graph": ok_precheck["graph"]}, expect_status=400)
+    assert pre_env["error"] == "invalid_payload", pre_env
+
+    if failures:
+        print("\n".join("FAIL: " + f for f in failures), file=sys.stderr)
+        return 1
+    print("全部冒烟检查通过 ✔")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
