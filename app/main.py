@@ -10,12 +10,14 @@ from fastapi.responses import JSONResponse
 
 from . import config
 from .db import (
+    VersionNotFoundError,
     connect,
     current_version,
     get_snapshot,
     init_db,
     publish_closures,
     publish_graph,
+    restore_version,
 )
 from .precheck import precheck as run_precheck
 from .routing import (
@@ -396,6 +398,70 @@ async def import_closures(request: Request):
             )
         return {
             "status": "published",
+            "data_version": new_version,
+            "previous_version": old_version,
+        }
+    finally:
+        conn.close()
+
+
+@app.post("/admin/restore")
+async def restore_data(request: Request):
+    """按历史版本恢复通行数据：整体复制为新版本并原子切换当前版本。
+
+    来源版本必须已存在；历史版本保留、版本号继续递增，绝不倒拨指针。
+    与其他发布并发时按写事务串行化，最终生效顺序由新版本号明确，
+    查询只会看到恢复前或恢复后的完整版本。
+    """
+    try:
+        payload = await request.json()
+    except Exception:
+        return JSONResponse(
+            status_code=400, content={"error": "invalid_payload", "detail": "请求体必须是合法 JSON"}
+        )
+    conn = connect()
+    try:
+        init_db(conn)
+        old_version = current_version(conn)
+
+        source = payload.get("source_version") if isinstance(payload, dict) else None
+        # 严格类型：与通行秒数校验一致，拒绝 bool/float/字符串等隐式转换
+        if isinstance(source, bool) or not isinstance(source, int):
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": "invalid_payload",
+                    "detail": "source_version 必须是正整数版本号",
+                    "rejected": True,
+                    "active_version": old_version,
+                },
+            )
+        if source <= 0:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": "invalid_payload",
+                    "detail": f"source_version 必须是正整数版本号，收到 {source}",
+                    "rejected": True,
+                    "active_version": old_version,
+                },
+            )
+        try:
+            new_version, source_version = restore_version(conn, source)
+        except VersionNotFoundError as exc:
+            return JSONResponse(
+                status_code=404,
+                content={
+                    "error": "version_not_found",
+                    "detail": str(exc),
+                    "rejected": True,
+                    "source_version": source,
+                    "active_version": old_version,
+                },
+            )
+        return {
+            "status": "restored",
+            "source_version": source_version,
             "data_version": new_version,
             "previous_version": old_version,
         }

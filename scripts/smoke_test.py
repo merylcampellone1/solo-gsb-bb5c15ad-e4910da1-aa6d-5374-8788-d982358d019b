@@ -345,6 +345,81 @@ def main() -> int:
                            {"graph": ok_precheck["graph"]}, expect_status=400)
     assert pre_env["error"] == "invalid_payload", pre_env
 
+    # 19. 历史版本恢复：发布链当前停在“无反向窗示例图”（v21 附近），
+    #     而 v1=示例图、v2=示例图+E4 封闭。先记录当前版本，再发布两次产生
+    #     可辨识的历史点：v_a 带 E1 封闭，v_b 清空封闭。
+    v_chain = call("GET", "/version")[1]["data_version"]
+    status, pub_a = call("POST", "/admin/closures", {
+        "closures": [{"edge_id": "E1",
+                      "start": "2026-10-05T07:00:00Z",
+                      "end": "2026-10-05T08:00:00Z"}]})
+    assert status == 200, pub_a
+    v_a = pub_a["data_version"]
+    status, pub_b = call("POST", "/admin/closures", {"closures": []})
+    assert status == 200, pub_b
+    v_b = pub_b["data_version"]
+    assert v_b == v_a + 1
+    assert call("GET", "/version")[1]["closures"] == 0
+
+    # 恢复到带 E1 封闭的历史版本 → 得到一个继续递增的新版本（不倒拨指针）
+    status, restored = call("POST", "/admin/restore", {"source_version": v_a})
+    assert status == 200, restored
+    v_r = restored["data_version"]
+    assert restored["status"] == "restored", restored
+    assert restored["source_version"] == v_a, restored
+    assert restored["previous_version"] == v_b, restored
+    assert v_r == v_b + 1 and v_r > v_a, restored  # 版本号继续递增
+    info = call("GET", "/version")[1]
+    assert info["data_version"] == v_r and info["closures"] == 1, info
+
+    # 恢复后查询看到的是完整的旧封闭：07:30 走 E1 被封闭，
+    # 08:00 整可进入（半开边界）；GATE->PLAZA 直达仅 E1
+    status, blocked = call("POST", "/api/route", {
+        "origin": "GATE", "destination": "PLAZA",
+        "departure_time": "2026-10-05T07:30:00Z",
+    })
+    assert blocked["segments"][0]["enter_time"] == "2026-10-05T08:00:00Z", blocked
+    assert blocked["data_version"] == v_r, blocked
+    print(f"历史恢复: v{v_b} 恢复自 v{v_a} -> v{v_r}，E1 封闭整体回来")
+
+    # 恢复版本再恢复一次到更早的 v2（示例图 + E4 封闭）：四类数据完整复制
+    status, restored2 = call("POST", "/admin/restore", {"source_version": 2})
+    assert status == 200, restored2
+    v_r2 = restored2["data_version"]
+    assert v_r2 == v_r + 1 and restored2["source_version"] == 2, restored2
+    info2 = call("GET", "/version")[1]
+    assert info2["data_version"] == v_r2 and info2["closures"] == 1, info2
+    assert info2["nodes"] == 5 and info2["edges"] == 6, info2
+    # E4 在 10:00–11:00 封闭重新生效：09:55 出发绕行
+    status, route_after = call("POST", "/api/route", {
+        "origin": "GATE", "destination": "TOWER",
+        "departure_time": "2026-10-05T09:55:00Z",
+    })
+    assert route_after["data_version"] == v_r2, route_after
+    assert route_after["edge_sequence"] != ["E1", "E2", "E4"], route_after
+    print(f"再次恢复: -> v{v_r2}（来源 v2），示例图与 E4 封闭完整还原")
+
+    # 20. 恢复拒绝场景：来源版本不存在 / 参数非法 → 生效版本不变
+    active_before = call("GET", "/version")[1]["data_version"]
+    status, rnf = call("POST", "/admin/restore",
+                       {"source_version": 99999}, expect_status=404)
+    assert rnf["error"] == "version_not_found", rnf
+    assert rnf["source_version"] == 99999 and rnf["active_version"] == active_before, rnf
+    for bad_body in ({"source_version": 0}, {"source_version": -3},
+                     {"source_version": "2"}, {"source_version": 2.0},
+                     {"source_version": True}, {}, {"source": 2}, []):
+        status, badr = call("POST", "/admin/restore", bad_body, expect_status=400)
+        assert badr["error"] == "invalid_payload", (bad_body, badr)
+        assert badr["active_version"] == active_before, (bad_body, badr)
+    assert call("GET", "/version")[1]["data_version"] == active_before
+    print(f"恢复非法/未知来源被拒绝，生效版本保持 v{active_before}")
+
+    # 末尾恢复到 v2（初始示例数据：示例图 + E4 封闭），保证重复冒烟状态一致
+    if active_before != 2:
+        call("POST", "/admin/restore", {"source_version": 2})
+    assert call("GET", "/version")[1]["closures"] == 1
+    print("已恢复至初始示例版本（v2 内容），便于重复冒烟")
+
     if failures:
         print("\n".join("FAIL: " + f for f in failures), file=sys.stderr)
         return 1

@@ -2,13 +2,16 @@
 
 版本模型
 --------
-每次导入（步道图或封闭记录）生成一个新版本号：
+每次发布（步道图、封闭记录或历史版本恢复）生成一个新版本号：
 
 - 新版本完整复制上一版本的节点/路段/封闭记录，再覆盖被更新的那部分；
+  恢复（kind='restore'）则整体复制**指定历史版本**的节点/路段/封闭记录/
+  反向通行窗，不覆盖任何部分；
 - ``meta`` 表中的 ``current_version`` 指针在同一事务内切换；
-- 查询通过 :func:`get_snapshot` 在开始时读取一次指针，整次请求固定使用该版本。
+- 查询通过 :func:`get_snapshot` 在开始时读取一次指针，整次请求固定使用该版本；
+- 历史版本（含被恢复的来源版本）全部保留，恢复只新增版本、绝不倒拨指针。
 
-导入失败时事务整体回滚，旧版本保持不动。
+发布/恢复失败时事务整体回滚，旧版本保持不动。
 """
 import json
 import sqlite3
@@ -27,7 +30,7 @@ CREATE TABLE IF NOT EXISTS meta (
 
 CREATE TABLE IF NOT EXISTS versions (
     version_id  INTEGER PRIMARY KEY AUTOINCREMENT,
-    kind        TEXT NOT NULL CHECK (kind IN ('graph', 'closures')),
+    kind        TEXT NOT NULL CHECK (kind IN ('graph', 'closures', 'restore')),
     created_at  INTEGER NOT NULL DEFAULT (strftime('%s','now'))
 );
 
@@ -68,7 +71,17 @@ CREATE TABLE IF NOT EXISTS reverse_windows (
 CREATE INDEX IF NOT EXISTS idx_edges_from     ON edges(version_id, from_node);
 CREATE INDEX IF NOT EXISTS idx_closures_edge ON closures(version_id, edge_id);
 CREATE INDEX IF NOT EXISTS idx_reverse_edge  ON reverse_windows(version_id, edge_id);
+
+CREATE TABLE IF NOT EXISTS restore_events (
+    new_version     INTEGER PRIMARY KEY,
+    source_version  INTEGER NOT NULL,
+    created_at      INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+);
 """
+
+
+class VersionNotFoundError(LookupError):
+    """指定的历史版本不存在（恢复操作据此拒绝并保持当前版本不变）。"""
 
 
 class EdgeRow(NamedTuple):
@@ -118,11 +131,37 @@ def connect(db_path: Optional[Path] = None) -> sqlite3.Connection:
 
 
 def init_db(conn: sqlite3.Connection) -> None:
-    """建表并写入初始指针（不存在任何已发布版本时）。"""
+    """建表并写入初始指针（不存在任何已发布版本时）。
+
+    对早期建库（``versions.kind`` 尚不接受 ``'restore'``、且无
+    ``restore_events`` 表）的数据库做一次幂等在线升级。
+    """
     conn.executescript(SCHEMA)
+    _migrate_versions_kind(conn)
     conn.execute(
         "INSERT OR IGNORE INTO meta(key, value) VALUES ('current_version', '0')"
     )
+
+
+def _migrate_versions_kind(conn: sqlite3.Connection) -> None:
+    """旧库升级：放开 versions.kind 以允许 'restore'（数据与版本号原样保留）。"""
+    ddl = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='versions'"
+    ).fetchone()
+    if ddl is not None and "'restore'" not in (ddl["sql"] or ""):
+        conn.executescript(
+            """
+            CREATE TABLE versions_new (
+                version_id  INTEGER PRIMARY KEY AUTOINCREMENT,
+                kind        TEXT NOT NULL CHECK (kind IN ('graph', 'closures', 'restore')),
+                created_at  INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+            );
+            INSERT INTO versions_new(version_id, kind, created_at)
+                SELECT version_id, kind, created_at FROM versions;
+            DROP TABLE versions;
+            ALTER TABLE versions_new RENAME TO versions;
+            """
+        )
 
 
 @contextmanager
@@ -246,6 +285,58 @@ def publish_closures(conn: sqlite3.Connection, payload) -> int:
             "UPDATE meta SET value=? WHERE key='current_version'", (str(new),)
         )
     return new
+
+
+def restore_version(conn: sqlite3.Connection, source_version: int) -> tuple[int, int]:
+    """把指定历史版本整体恢复为一个新生效版本。
+
+    - ``source_version`` 必须是已存在的历史版本（正整数）；
+    - 新版本号在已用最大版本号上继续递增，来源版本与全部历史版本原样保留，
+      ``current_version`` 不会被倒拨，只会指向新增的恢复版本；
+    - 节点、路段、封闭记录、反向通行窗四类数据全部按来源版本完整复制，
+      不做任何覆盖或“悬挂封闭记录”清理；
+    - 全部操作（版本号分配、四类数据复制、指针切换、来源记录）在同一个
+      ``BEGIN IMMEDIATE`` 写事务内完成，与其他发布/恢复严格串行化；
+    - 参数非法或来源版本不存在时抛 :class:`ValueError` /
+      :class:`VersionNotFoundError` 并整体回滚，生效版本保持不变。
+
+    返回 ``(new_version, source_version)``。
+    """
+    if isinstance(source_version, bool) or not isinstance(source_version, int):
+        raise ValueError("source_version 必须是正整数版本号")
+    if source_version <= 0:
+        raise ValueError(f"source_version 必须是正整数版本号，收到 {source_version}")
+
+    with transaction(conn):
+        exists = conn.execute(
+            "SELECT 1 FROM versions WHERE version_id=?", (source_version,)
+        ).fetchone()
+        if exists is None:
+            raise VersionNotFoundError(f"历史版本不存在: v{source_version}")
+
+        new = int(
+            conn.execute(
+                "SELECT COALESCE(MAX(version_id), 0) + 1 AS v FROM versions"
+            ).fetchone()["v"]
+        )
+        # 整体复制来源版本的四类通行数据，恢复版本自身是一次独立的新发布
+        _copy_version(conn, source_version, new, "restore")
+        conn.execute(
+            "INSERT INTO restore_events(new_version, source_version) VALUES (?, ?)",
+            (new, source_version),
+        )
+        conn.execute(
+            "UPDATE meta SET value=? WHERE key='current_version'", (str(new),)
+        )
+    return new, source_version
+
+
+def get_restore_source(conn: sqlite3.Connection, version_id: int) -> Optional[int]:
+    """若某版本是恢复版本，返回其来源版本号，否则返回 None。"""
+    row = conn.execute(
+        "SELECT source_version FROM restore_events WHERE new_version=?", (version_id,)
+    ).fetchone()
+    return None if row is None else int(row["source_version"])
 
 
 def get_snapshot(conn: sqlite3.Connection, version_id: Optional[int] = None) -> Optional[Snapshot]:

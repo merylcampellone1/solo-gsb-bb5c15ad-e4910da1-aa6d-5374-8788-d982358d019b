@@ -8,7 +8,8 @@
 指定**按顺序停靠的站点**（每站带开始停留时间窗与停留秒数），见第 4.1 节；
 也支持为**多名访客**在候选节点中选择公共汇合点，见第 4.2 节。导入前可用
 **联合预检**接口一次性校验候选步道图与封闭记录（含反向通行窗），返回
-全部可判定错误且不改动当前数据，见第 4.3 节。
+全部可判定错误且不改动当前数据，见第 4.3 节。误发布后可指定**历史版本**
+将节点、路段、封闭记录与反向通行窗整体恢复为继续递增的新生效版本，见第 4.4 节。
 
 - 语言/存储：Python 3.11 + SQLite（标准库，无需外部数据库）
 - Web 框架：FastAPI + Uvicorn
@@ -428,6 +429,67 @@ python -m app.cli serve
 | 候选数据未通过校验（响应体含全部错误明细） | `200` | —（`ok: false`） |
 | 请求包络非法（非 JSON 对象、缺少 `graph`/`closures`） | `400` | `invalid_payload` |
 
+### 4.4 按历史版本恢复（`POST /admin/restore`）
+
+管理员误发布步道图或封闭记录后，可指定一个**已存在的历史版本**，把该版本的
+**节点、路段、封闭记录、反向通行窗**四类数据整体恢复为一个新的生效版本：
+
+```bash
+curl -X POST http://localhost:8080/admin/restore \
+  -H 'Content-Type: application/json' \
+  -d '{"source_version": 2}'
+```
+
+响应 `200`：
+
+```json
+{
+  "status": "restored",
+  "source_version": 2,
+  "data_version": 5,
+  "previous_version": 4
+}
+```
+
+- `source_version`：本次恢复的数据来源版本（必须已存在）；
+- `data_version`：恢复生成的**新版本号**，恢复完成后即生效版本；
+- `previous_version`：恢复前的生效版本。
+
+语义与版本规则：
+
+- **恢复即新发布**：新版本在已用最大版本号上继续递增，来源版本与全部历史版本
+  原样保留、可随时按版本号追溯；**不会倒拨** `current_version` 指针；
+- **整体复制四类数据**：恢复版本的节点、路段、封闭记录、反向通行窗与来源版本
+  完全一致，不做局部覆盖或悬挂封闭记录清理（恢复来源版本当时是什么就是什么）；
+- **并发顺序明确**：恢复与 `POST /admin/graph`、`POST /admin/closures` 一样，
+  在同一个 `BEGIN IMMEDIATE` 写事务中完成版本号分配、数据复制与指针切换，
+  多个写操作严格串行化，各自获得互不重复的递增版本号；**最终生效顺序即版本号
+  大小顺序**，最后一个提交的写事务生效；
+- **查询只读完整版本**：路线/汇合查询在请求开始时固定一个数据版本，写事务
+  提交前读到旧版本、提交后读到新版本，绝不会读到恢复一半的拼接状态；
+- 恢复当前正在生效的版本也允许：得到一份内容相同、版本号更新的副本；
+- 恢复之后继续发布图或封闭记录，以恢复版本为基线（与普通发布链路一致）。
+
+错误映射（**任何拒绝都不改变生效版本**，响应体回带 `active_version`）：
+
+| 场景 | 状态码 | `error` |
+| --- | --- | --- |
+| `source_version` 缺失，或非正整数（`0`、负数、小数、布尔、字符串等） | `400` | `invalid_payload` |
+| 来源版本不存在（尚未分配的版本号） | `404` | `version_not_found` |
+| 请求体不是合法 JSON / 不是 JSON 对象 | `400` | `invalid_payload` |
+
+`404` 响应示例：
+
+```json
+{
+  "error": "version_not_found",
+  "detail": "历史版本不存在: v999",
+  "rejected": true,
+  "source_version": 999,
+  "active_version": 5
+}
+```
+
 ### `POST /admin/graph` — 原子发布新步道图
 
 ```bash
@@ -585,7 +647,26 @@ curl -s -X POST http://localhost:8080/admin/precheck \
 #      {"source":"closures","path":"closures[0]","index":0,"message":"...无效时间区间..."}],
 #    "data_version":...}
 
-# 冒烟自检（需服务已启动；内含反向窗导入/拒绝、窗内通行与联合预检检查）
+# 按历史版本恢复：把 v2 的节点/路段/封闭/反向窗整体复制为新版本并立即生效
+curl -s -X POST http://localhost:8080/admin/restore \
+  -H 'Content-Type: application/json' \
+  -d '{"source_version":2}'
+# → {"status":"restored","source_version":2,"data_version":5,"previous_version":4}
+
+# 来源版本不存在 → 404，生效版本不变
+curl -s -X POST http://localhost:8080/admin/restore \
+  -H 'Content-Type: application/json' \
+  -d '{"source_version":999}'
+# → {"error":"version_not_found",...,"rejected":true,
+#    "source_version":999,"active_version":5}
+
+# 参数非法（非正整数）→ 400，生效版本不变
+curl -s -X POST http://localhost:8080/admin/restore \
+  -H 'Content-Type: application/json' \
+  -d '{"source_version":"2"}'
+# → {"error":"invalid_payload",...,"rejected":true,"active_version":5}
+
+# 冒烟自检（需服务已启动；内含反向窗导入/拒绝、窗内通行、联合预检、历史版本恢复检查）
 python3 scripts/smoke_test.py http://localhost:8080
 ```
 
@@ -696,6 +777,26 @@ else:
         print(err["source"], err["path"], err["message"])
 ```
 
+历史版本恢复 Python 示例：
+
+```python
+import json, urllib.error, urllib.request
+
+req = urllib.request.Request(
+    "http://localhost:8080/admin/restore",
+    data=json.dumps({"source_version": 2}).encode(),
+    headers={"Content-Type": "application/json"},
+)
+try:
+    with urllib.request.urlopen(req) as resp:
+        result = json.load(resp)
+    print(f"已恢复 v{result['source_version']} -> 新生效 v{result['data_version']}")
+except urllib.error.HTTPError as e:
+    detail = json.load(e.read())
+    # 404: version_not_found（来源版本不存在）；400: invalid_payload（参数非法）
+    print("恢复被拒绝:", e.code, detail["error"], "当前生效版本:", detail["active_version"])
+```
+
 ---
 
 ## 6. 选路与版本语义
@@ -725,11 +826,15 @@ else:
   序列时按当时所在节点确定方向。反向窗无效或重叠时图导入在事务前校验
   失败，整次导入拒绝、旧版本保留。
 - **原子发布与版本一致**：
-  - 每次导入（图或封闭）在一个 SQLite 写事务中完成全部校验、复制与版本指针切换，
-    失败整体回滚；
+  - 每次导入（图或封闭）或历史版本恢复在一个 SQLite 写事务中完成全部复制与
+    版本指针切换，失败整体回滚；
+  - 恢复（`POST /admin/restore`）不修改、不删除任何历史版本：它把指定版本的
+    节点/路段/封闭记录/反向窗整体复制到一个**新递增版本号**下再切换指针；
+  - 所有写操作使用 `BEGIN IMMEDIATE` 立即取写锁，互相串行提交，版本号互不重复，
+    并发恢复/发布的**最终生效顺序等于版本号顺序**（最后提交者生效）；
   - 每次查询在开始时读取一次 `current_version` 并固定，**整次请求只用同一版本**，
-    导入进行中或刚完成都不会看到半个版本；
-  - 历史版本在库中保留，可按版本号追溯。
+    恢复或导入进行中都不会看到半个版本或跨版本拼接数据；
+  - 历史版本在库中保留，可按版本号追溯，恢复来源记录在 `restore_events` 表。
 
 ---
 
@@ -741,14 +846,14 @@ app/
   timeutil.py      # ISO 8601 <-> 纪元秒（UTC）
   schemas.py       # 导入/查询负载校验（含停靠点 stops、多人汇合 meeting、反向窗）
   precheck.py      # 联合预检：候选图+封闭记录只读批量校验（收集全部错误及位置）
-  db.py            # SQLite 版本化与原子发布
+  db.py            # SQLite 版本化、原子发布与历史版本恢复
   routing.py       # 时间依赖最短路 + 字典序选路引擎（含按顺序停靠、多人汇合、反向窗）
   main.py          # FastAPI 路由
   sample_data.py   # 内置示例数据
   cli.py           # init-db / import-* / serve
 data/              # 示例 JSON 与本地数据库
 scripts/smoke_test.py
-tests/             # 标准库 unittest 测试（136 个用例）
+tests/             # 标准库 unittest 测试（147 个用例）
 Dockerfile
 docker-compose.yml
 docker-entrypoint.sh
@@ -770,4 +875,8 @@ python3 -m unittest discover -s tests -v
 无效/重叠窗拒绝整次导入并保留旧版本、版本快照与复制）、
 联合预检（全部错误收集与原数组位置、候选图交叉校验封闭引用、
 图无效时封闭引用不误报、通过时计数、预检不改变数据版本）、
+历史版本恢复（四类数据整体复制、版本号继续递增且不倒拨指针、
+来源/历史版本可追溯、恢复后再发布以恢复版本为基线、
+未知版本 404 与非法参数 400 均不改变生效版本、
+并发恢复/发布串行化得到连续唯一版本号且读者只见完整版本、旧库在线升级）、
 无路线、原子发布回滚与版本快照等场景。
